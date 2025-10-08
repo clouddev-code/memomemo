@@ -1,127 +1,70 @@
-# memomemo
-
- Grafana lokiでECSで構築しています。ECSは意図せずタスクが入れ替えることがあ
+> Grafana lokiでECSで構築しています。ECSは意図せずタスクが入れ替えることがあ
 ります、作業用のインデックスを保存する場所として適切なストレージを教えて 
+ホットデータはローカルキャッシュとして使う認識ですか。S3にフラッシュする前に
+タスク異例変わる場合てどうですか 
 
-⏺ ECS上のGrafana Lokiで作業用インデックスを保存する場合、以下のストレージオプ
-  ションが適切です:
+⏺ ECSでGrafana Lokiを構築する場合、タスクが入れ替わることを考慮したストレージ
+  設計が重要です。
 
-  推奨オプション
+  インデックス保存に適したストレージ
 
-  1. Amazon S3 (最も推奨)
-    - Lokiのデフォルト推奨ストレージ
-    - タスク入れ替えに強い
-    - boltdb-shipperまたはTSDB形式でインデックス保存
-    - コスト効率が良い
-  2. Amazon EFS (Elastic File System)
-    - 複数タスク間で共有可能
-    - NFSベースの永続ストレージ
-    - リアルタイム同期が必要な場合に有効
-  3. EBS (非推奨)
-    - 単一タスクにしかアタッチできない
-    - タスク入れ替え時にデータロスのリスク
+  推奨: EFS (Elastic File System)
+  - 複数のECSタスク間で共有可能
+  - タスクが入れ替わってもデータが永続化
+  - Lokiのboltdb-shipperやtsdbインデックスに最適
 
-  推奨構成例
-
+  設定例:
   schema_config:
     configs:
       - from: 2024-01-01
         store: tsdb
         object_store: s3
-        schema: v13
+        schema: v12
         index:
           prefix: loki_index_
           period: 24h
 
   storage_config:
     aws:
-      s3: s3://your-region/your-bucket
+      s3: s3://your-bucket/loki
       region: ap-northeast-1
-    tsdb_shipper:
-      active_index_directory: /loki/index
-      cache_location: /loki/cache
-      shared_store: s3
+    filesystem:
+      directory: /loki/index  # EFSマウントポイント
 
-  結論: S3をバックエンドストレージとして使用し、ローカル(/loki/index)は一時キ
-  ャッシュとして扱うのが最適です。EFSはコストが高いため、特別な要件がない限り
-  S3で十分です。
+  ホットデータとタスク入れ替え時の対応
 
-> EFSの場合複数タスクからアクセスする場合がありますが競合とかありますか 
+  ご認識の通り、ホットデータはローカルキャッシュです。
 
-⏺ EFS使用時の複数タスクからのアクセスには以下の考慮点があります:
+  タスク入れ替え時のリスク:
+  - S3へのフラッシュ前にタスクが停止すると、そのデータは失われる可能性があり
+  ます
 
-  Lokiのアーキテクチャによる違い
+  対策:
 
-  1. モノリシックモード (単一プロセス)
-  - ❌ 競合発生のリスクあり
-  - 複数タスクが同じインデックスファイルに書き込むと破損の可能性
-  - 単一タスク構成が必須
-
-  2. マイクロサービスモード (推奨)
-  - ✅ 適切に設計すれば競合なし
-  - コンポーネント別にタスクを分離:
-    - Ingester: 書き込み専用 (複数可、各自が異なるデータを処理)
-    - Querier: 読み取り専用 (複数可)
-    - Compactor: 1タスクのみ推奨
-
-  # マイクロサービスモード例
+  1. WAL (Write-Ahead Log) の設定
   ingester:
     wal:
       enabled: true
-      dir: /loki/wal
-    chunk_idle_period: 1h
-    max_chunk_age: 2h
+      dir: /loki/wal  # EFSマウント
+      flush_on_shutdown: true
+    chunk_idle_period: 5m
+    chunk_retain_period: 30s
+    max_chunk_age: 1h
 
-  compactor:
-    working_directory: /loki/compactor
-    shared_store: s3
-    compaction_interval: 10m
-
-  重要な注意点
-
-  - Compactorは必ず1タスクのみで実行 (複数実行するとインデックス破損)
-  - WAL (Write-Ahead Log) ディレクトリは各Ingesterで分離が必要
-  - EFSのパフォーマンスモード設定 (Max I/O推奨)
-
-  結論: マイクロサービスモードで適切に設計すれば問題ありませんが、設定ミスに
-  よる競合リスクがあるため、シンプルな構成ならS3ベース (boltdb-shipper/TSDB) 
-  が安全です。
-
-
-⏺ はい、その認識で正しいです。
-
-  Lokiのストレージ階層
-
-  ホットデータ (最新データ)
-  - ローカルディスク (/loki/index, /loki/chunks) にキャッシュ
-  - 高速クエリのため一時的に保持
-  - タスク再起動時は失われても問題なし
-
-  コールドデータ (古いデータ)
-  - S3/EFSなどの永続ストレージに保存
-  - 必要に応じてローカルにダウンロード
-
-  典型的な動作フロー
-
-  # TSDB例
-  storage_config:
-    tsdb_shipper:
-      active_index_directory: /loki/index  # ← ホットキャッシュ
-      cache_location: /loki/cache          # ← クエリキャッシュ
-      shared_store: s3                     # ← 永続ストレージ
-
+  2. 適切なフラッシュ設定
   ingester:
-    chunk_target_size: 1536000
-    chunk_idle_period: 30m
-    max_chunk_age: 1h    # この期間後S3へフラッシュ
+    chunk_target_size: 1572864  # 1.5MB
+    max_chunk_age: 1h  # 短くするとデータロスのリスク減
+    flush_op_timeout: 10s
 
-  1. Ingesterが新しいログをローカルに書き込み
-  2. 一定期間/サイズに達したらS3へアップロード
-  3. クエリ時は必要に応じてS3から取得してキャッシュ
+  3. グレースフルシャットダウン
+  # ECSタスク定義
+  stopTimeout: 120  # 十分な時間を確保
 
-  メリット:
-  - タスク入れ替えでキャッシュが消えても、S3から再取得可能
-  - ローカルストレージは小容量でOK (EBSでも可)
-  - データロスなし
+  ベストプラクティス:
+  - インデックス: EFS
+  - WAL: EFS (データロス防止)
+  - チャンク: S3 (最終的な保存先)
+  - ローカルキャッシュ: タスクローカルストレージ (パフォーマンス用)
 
-  この設計なら、ECSタスクの再起動や入れ替えに強い構成になります。
+  この構成でタスク入れ替え時のデータロスを最小化できます。
